@@ -1,7 +1,6 @@
-use crate::server::{treat, Server};
+use crate::server::{Server};
 use crate::cache::Cache;
 use std::{
-    io::{Read, Write},
     net::{TcpListener, TcpStream},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -11,6 +10,7 @@ use std::{
     time::Duration,
 };
 use std::sync::RwLock;
+use crate::server::tcp_session_handler::TcpSessionHandler;
 
 pub struct TCPServerSettings {
     pub port: u16,
@@ -39,52 +39,7 @@ impl Server<TCPServerSettings> for TCPServer {
             let queue = Arc::clone(&self.queue);
             let should_stop = Arc::clone(&self.should_stop);
             let cache = Arc::clone(&self.cache);
-
-            let handle = thread::spawn(move || {
-                while !should_stop.load(Ordering::SeqCst) {
-                    let mut stream_opt = {
-                        let mut queue_guard = queue.lock().unwrap();
-                        queue_guard.pop()
-                    };
-
-                    if let Some(mut stream) = stream_opt {
-                        let i = 199;
-                        let mut buffer = [0u8; 1];
-                        let mut missed_laps = 0;
-
-                        while missed_laps < 10 {
-                            match stream.read(&mut buffer) {
-                                Ok(amt) if amt > 0 => {
-                                    let data = buffer[..amt].to_vec();
-                                    println!("[Worker {}] Received {} bytes", i, amt);
-
-                                    if let Some(response) = treat(i as u8, data, Arc::clone(&cache), &stream) {
-                                        let _ = stream.write_all(&response);
-                                    }
-
-                                    missed_laps = 0;
-                                }
-                                Ok(_) => {
-                                    println!("[Worker {}] Idle connection...", i);
-                                    thread::sleep(Duration::from_secs(1));
-                                    missed_laps += 1;
-                                }
-                                Err(e) => {
-                                    eprintln!("[Worker {}] Read error: {}", i, e);
-                                    break;
-                                }
-                            }
-                        }
-
-                        println!("[Worker {}] Connection closed.", i);
-                    } else {
-                        thread::sleep(Duration::from_millis(1));
-                    }
-                }
-
-                println!("[Worker {}] Shutting down...", i);
-            });
-
+            let handle = thread::spawn(move || {TcpSessionHandler::new(i, should_stop, cache, queue, Duration::from_secs(1)).run()});
             handles.push(handle);
         }
 
@@ -93,6 +48,7 @@ impl Server<TCPServerSettings> for TCPServer {
         let should_stop = Arc::clone(&self.should_stop);
 
         thread::spawn(move || {
+            println!("Listening on port {}", listener.local_addr().unwrap().port());
             while !should_stop.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((stream, addr)) => {
