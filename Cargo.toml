@@ -5,4 +5,7 @@ edition = "2021"
 
 [dependencies]
 ctrlc = "3.4"
-flate2 = "1.1.1"
+rudish_lib = {path = "../RustroverProjects/rudish_lib"}
+
+[profile.release]
+debug = true

@@ -1,41 +1,76 @@
 use crate::cache::Cache;
-use crate::server::{extract_string, BUFFER_SIZE};
+use crate::server::{BUFFER_SIZE};
 use std::collections::VecDeque;
-use std::io::Write;
-use std::net::TcpStream;
 use std::ops::Add;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
+use rudish_lib::{drain_from_master_buffer, extract_string, safe_fill, PING};
 
 #[derive(Clone)]
 enum Signal {
     Hello,
     Put(u8),
     Get,
+    Ping,
     None,
 }
+
+fn add_get_data(data: &[u8]) -> Vec<u8> {
+    let data_len = data.len();
+
+    let bytes_needed =  ((data_len as f64).log2().ceil() as usize + 7) / 8;
+
+    if bytes_needed > 3 {
+        panic!("data too long");
+    }
+
+    let msg: u8 =  match bytes_needed {
+        0 => {0b1000_0000}
+        1 => {0b1001_0000}
+        2 => {0b1010_0000}
+        3 => {0b1011_0000}
+        _ => {panic!("This Shouldn't happen")}
+    };
+
+    let mut size_in_bytes = Vec::with_capacity(bytes_needed);
+    for i in (0..bytes_needed).rev() {
+        let shift = i * 8;
+        size_in_bytes.push(((data_len >> shift) & 0xFF) as u8);
+    }
+
+    let mut final_message = vec![msg];
+    final_message.append(&mut size_in_bytes);
+    final_message.extend_from_slice(data);
+    final_message
+}
+
 
 pub struct RudishSessionHandler {
     handler_id: usize,
     cache: Arc<RwLock<Cache>>,
     master_buffer: Arc<RwLock<[u8; BUFFER_SIZE]>>,
+    write_master_buffer: Arc<RwLock<[u8; BUFFER_SIZE]>>,
 }
+
+
 
 impl RudishSessionHandler {
     pub fn new(
         handler_id: usize,
         cache: Arc<RwLock<Cache>>,
         master_buffer: Arc<RwLock<[u8; BUFFER_SIZE]>>,
+        write_master_buffer: Arc<RwLock<[u8; 2048]>>,
     ) -> Self {
         Self {
             handler_id,
             cache,
             master_buffer,
+            write_master_buffer
         }
     }
-    pub fn run(self, should_terminate: Arc<AtomicBool>, master_buffer_size: Arc<AtomicUsize>, mut stream: TcpStream) {
+    pub fn run(mut self, should_terminate: Arc<AtomicBool>, master_buffer_size: Arc<AtomicUsize>, write_master_buffer_size: Arc<AtomicUsize>) {
         let mut data: VecDeque<u8> = VecDeque::new();
         let mut required_bytes: usize = 1;
         let mut signal: Signal= Signal::None;
@@ -43,35 +78,19 @@ impl RudishSessionHandler {
         while !should_terminate.load(Ordering::Relaxed) {
             let mut buffer = [0u8; BUFFER_SIZE];
 
-            let bytes = {
-                let mut locked_master_buffer = self.master_buffer.write().unwrap();
-                let current_size = master_buffer_size.load(Ordering::Relaxed);
-
-                if current_size == 0 {
-                    drop(locked_master_buffer);
-                    thread::sleep(Duration::from_micros(10));
-                    continue;
-                }
-
-                let to_copy = buffer.len().min(current_size);
-
-                buffer[..to_copy].copy_from_slice(&locked_master_buffer[..to_copy]);
-
-                let remaining = current_size - to_copy;
-                locked_master_buffer.copy_within(to_copy..current_size, 0);
-
-                locked_master_buffer[remaining..current_size].fill(0);
-
-                master_buffer_size.store(remaining, Ordering::Relaxed);
-
-                to_copy
-            };
-
+            let bytes =
+                match drain_from_master_buffer(&self.master_buffer, &master_buffer_size, &mut buffer){
+                    Some(bytes) => bytes,
+                    None => {
+                        thread::sleep(Duration::from_micros(10));
+                        continue;
+                    },
+                };
 
             data.extend(buffer[..bytes].iter().cloned());
 
             if data.len() >= required_bytes {
-                process(&mut data, signal.clone(), self.cache.clone(), &mut stream).map(|x |{
+                process(&should_terminate, &mut data, signal.clone(), self.cache.clone(), &mut self.write_master_buffer, &write_master_buffer_size).map(|x |{
                     signal = x.1;
                     required_bytes = x.0;
                 });
@@ -80,7 +99,7 @@ impl RudishSessionHandler {
     }
 }
 
-fn process(data: &mut VecDeque<u8>, signal: Signal, cache: Arc<RwLock<Cache>>, stream: &mut TcpStream) -> Option<(usize, Signal)> {
+fn process(should_terminate: &AtomicBool, data: &mut VecDeque<u8>, signal: Signal, cache: Arc<RwLock<Cache>>, output_data: &mut Arc<RwLock<[u8; BUFFER_SIZE]>>, write_master_buffer_size: &Arc<AtomicUsize>) -> Option<(usize, Signal)> {
 
     let mut current_signal = signal;
 
@@ -102,6 +121,7 @@ fn process(data: &mut VecDeque<u8>, signal: Signal, cache: Arc<RwLock<Cache>>, s
                 current_signal = match intention_bits {
                     0b01 => Signal::Put(first_byte.clone()),
                     0b10 => Signal::Get,
+                    0b11 => Signal::Ping,
                     _ => Signal::None,
                 };
 
@@ -130,11 +150,11 @@ fn process(data: &mut VecDeque<u8>, signal: Signal, cache: Arc<RwLock<Cache>>, s
 
                 let value_size = data
                     .iter()
-                    .skip(needed_bytes-1)
+                    .skip(needed_bytes-second_top_bits as usize)
                     .take(second_top_bits as usize)
                     .fold(0usize, |acc, &b| (acc << 8) | b as usize);
 
-                let header_end = needed_bytes + second_top_bits as usize -1;
+                let header_end = needed_bytes;
                 let expected_value_len = value_size.add(header_end);
 
                 if data.len() < expected_value_len {
@@ -155,7 +175,9 @@ fn process(data: &mut VecDeque<u8>, signal: Signal, cache: Arc<RwLock<Cache>>, s
 
                 println!("topic: {:?}, key: {:?}, data_string: {:?}", topic, key, data_string);
 
-                cache.try_write().unwrap().put(&topic, &key, &data_string);
+                {
+                    cache.write().unwrap().put(&topic, &key, &data_string);
+                }
 
 
                 for _ in 0..expected_value_len {
@@ -189,17 +211,14 @@ fn process(data: &mut VecDeque<u8>, signal: Signal, cache: Arc<RwLock<Cache>>, s
 
                 let topic = extract_string(&contiguous[topic_position.0..topic_position.1]);
                 let key = extract_string(&contiguous[key_position.0..key_position.1]);
-
+                
                 let result = cache.read().unwrap().get(&*topic, &*key);
 
 
                 match result {
                     Ok(value) => {
-
-                        println!("topic: {:?}, key: {:?}", topic, key);
-
-
-                        stream.write(value.as_bytes()).unwrap();
+                        let msg = add_get_data(value.as_bytes());
+                        safe_fill(should_terminate, output_data, write_master_buffer_size, &*msg, msg.len() );
                     }
                     _ => {}
                 }
@@ -207,7 +226,12 @@ fn process(data: &mut VecDeque<u8>, signal: Signal, cache: Arc<RwLock<Cache>>, s
 
 
                 current_signal = Signal::None
-            }
+            },
+            Signal::Ping => {
+                let msg = &[PING];
+                safe_fill(should_terminate, output_data, write_master_buffer_size, &*msg, 1 );
+                current_signal = Signal::None
+            },
             _ => {}
         }
 
