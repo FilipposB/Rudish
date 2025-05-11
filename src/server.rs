@@ -12,4 +12,4 @@ pub trait Server<T> {
     fn new(config: T, terminate: Arc<AtomicBool>) -> Self;
 }
 
-pub(crate) const BUFFER_SIZE: usize = 2048;
+pub(crate) const BUFFER_SIZE: usize = 1024*5;

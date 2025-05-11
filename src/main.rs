@@ -1,5 +1,5 @@
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
-use std::io;
+use std::{io, thread};
 use rudish::server::Server;
 use rudish::server::tcp_server::{TCPServer, TCPServerSettings};
 
@@ -7,6 +7,10 @@ use rudish::server::tcp_server::{TCPServer, TCPServerSettings};
 fn main() -> io::Result<()> {
     let should_stop = Arc::new(AtomicBool::new(false));
     let stop_flag = should_stop.clone();
+    tracing_subscriber::fmt()
+        .with_thread_names(true)
+        .with_max_level(tracing::Level::INFO)
+        .init();
 
     // Register Ctrl+C handler
     ctrlc::set_handler(move || {

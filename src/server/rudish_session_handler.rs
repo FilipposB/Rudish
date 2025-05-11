@@ -5,17 +5,9 @@ use std::ops::Add;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
-use std::time::Duration;
-use rudish_lib::{drain_from_master_buffer, extract_string, safe_fill, PING};
-
-#[derive(Clone)]
-enum Signal {
-    Hello,
-    Put(u8),
-    Get,
-    Ping,
-    None,
-}
+use std::time::{Duration, Instant};
+use rudish_lib::{drain_from_master_buffer, extract_string, safe_fill, PING, Signal};
+use tracing::{debug, trace};
 
 fn add_get_data(data: &[u8]) -> Vec<u8> {
     let data_len = data.len();
@@ -48,7 +40,6 @@ fn add_get_data(data: &[u8]) -> Vec<u8> {
 
 
 pub struct RudishSessionHandler {
-    handler_id: usize,
     cache: Arc<RwLock<Cache>>,
     master_buffer: Arc<RwLock<[u8; BUFFER_SIZE]>>,
     write_master_buffer: Arc<RwLock<[u8; BUFFER_SIZE]>>,
@@ -58,13 +49,11 @@ pub struct RudishSessionHandler {
 
 impl RudishSessionHandler {
     pub fn new(
-        handler_id: usize,
         cache: Arc<RwLock<Cache>>,
         master_buffer: Arc<RwLock<[u8; BUFFER_SIZE]>>,
-        write_master_buffer: Arc<RwLock<[u8; 2048]>>,
+        write_master_buffer: Arc<RwLock<[u8; BUFFER_SIZE]>>,
     ) -> Self {
         Self {
-            handler_id,
             cache,
             master_buffer,
             write_master_buffer
@@ -82,7 +71,7 @@ impl RudishSessionHandler {
                 match drain_from_master_buffer(&self.master_buffer, &master_buffer_size, &mut buffer){
                     Some(bytes) => bytes,
                     None => {
-                        thread::sleep(Duration::from_micros(10));
+                        thread::yield_now();
                         continue;
                     },
                 };
@@ -107,6 +96,8 @@ fn process(should_terminate: &AtomicBool, data: &mut VecDeque<u8>, signal: Signa
         return None;
     }
 
+    let start_time = Instant::now();
+
     loop {
         match current_signal {
             //No previous signal
@@ -116,11 +107,12 @@ fn process(should_terminate: &AtomicBool, data: &mut VecDeque<u8>, signal: Signa
                     return Some((1, Signal::None));
                 }
 
+
                 let first_byte = data.pop_front().unwrap();
                 let intention_bits = (first_byte & 0b1100_0000) >> 6;
                 current_signal = match intention_bits {
                     0b01 => Signal::Put(first_byte.clone()),
-                    0b10 => Signal::Get,
+                    0b10 => Signal::Get(first_byte.clone()),
                     0b11 => Signal::Ping,
                     _ => Signal::None,
                 };
@@ -173,8 +165,6 @@ fn process(should_terminate: &AtomicBool, data: &mut VecDeque<u8>, signal: Signa
 
                 let data_string = extract_string(&str_value);
 
-                println!("topic: {:?}, key: {:?}, data_string: {:?}", topic, key, data_string);
-
                 {
                     cache.write().unwrap().put(&topic, &key, &data_string);
                 }
@@ -186,7 +176,7 @@ fn process(should_terminate: &AtomicBool, data: &mut VecDeque<u8>, signal: Signa
 
                 current_signal = Signal::None
             }
-            Signal::Get => {
+            Signal::Get(_) => {
 
                 let mut needed_bytes = 2;
 
@@ -208,27 +198,28 @@ fn process(should_terminate: &AtomicBool, data: &mut VecDeque<u8>, signal: Signa
 
                 let contiguous = data.make_contiguous();
 
-
                 let topic = extract_string(&contiguous[topic_position.0..topic_position.1]);
                 let key = extract_string(&contiguous[key_position.0..key_position.1]);
-                
+
                 let result = cache.read().unwrap().get(&*topic, &*key);
 
 
                 match result {
                     Ok(value) => {
+                        trace!("Key: {} Value: {}",  key, value);
                         let msg = add_get_data(value.as_bytes());
                         safe_fill(should_terminate, output_data, write_master_buffer_size, &*msg, msg.len() );
                     }
                     _ => {}
                 }
+
+
                 data.drain(0..key_position.1);
-
-
                 current_signal = Signal::None
             },
             Signal::Ping => {
                 let msg = &[PING];
+                trace!("Received Ping");
                 safe_fill(should_terminate, output_data, write_master_buffer_size, &*msg, 1 );
                 current_signal = Signal::None
             },

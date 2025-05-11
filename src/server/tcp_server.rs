@@ -39,7 +39,8 @@ impl Server<TCPServerSettings> for TCPServer {
             let queue = Arc::clone(&self.queue);
             let should_stop = Arc::clone(&self.should_stop);
             let cache = Arc::clone(&self.cache);
-            let handle = thread::spawn(move || {TcpSessionHandler::new(i, should_stop, cache, queue, Duration::from_secs(5)).run()});
+            let handle =  thread::Builder::new()
+                .name(format!("Handler-{}", i)).spawn(move || {TcpSessionHandler::new(i, should_stop, cache, queue, Duration::from_secs(5)).run()}).unwrap();
             handles.push(handle);
         }
 
