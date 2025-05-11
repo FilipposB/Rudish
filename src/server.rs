@@ -1,4 +1,3 @@
-use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool};
 use std::sync::{Arc};
 
@@ -12,4 +11,4 @@ pub trait Server<T> {
     fn new(config: T, terminate: Arc<AtomicBool>) -> Self;
 }
 
-pub(crate) const BUFFER_SIZE: usize = 1024*5;
+pub(crate) const BUFFER_SIZE: usize = 1024 * 10;

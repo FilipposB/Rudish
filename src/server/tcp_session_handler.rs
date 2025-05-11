@@ -40,7 +40,7 @@ impl TcpSessionHandler {
 
         while !self.should_terminate.load(Ordering::SeqCst) {
             // Accept a TcpStream
-            let mut stream_opt = {
+            let stream_opt = {
                 let mut queue_guard = self.queue.lock().unwrap();
                 queue_guard.pop()
             };
@@ -67,7 +67,9 @@ impl TcpSessionHandler {
                     let master_buffer = write_master_buffer.clone();
                     let master_buffer_size = write_master_buffer_size.clone();
                     let mut stream = stream.try_clone().unwrap();
-
+                    
+                    let mut last_interaction = Instant::now();
+                    
                     write_handler =   thread::Builder::new()
                         .name(format!("Handler-{}", self.handler_id)).spawn(move || {
                         while !should_terminate.load(Ordering::Relaxed) {
@@ -77,11 +79,17 @@ impl TcpSessionHandler {
                                 match drain_from_master_buffer(&master_buffer, &master_buffer_size, &mut buffer){
                                     Some(bytes) => bytes,
                                     None => {
-                                        thread::yield_now();
+                                        if last_interaction.elapsed() > Duration::from_millis(100){
+                                            thread::sleep(Duration::from_millis(10));
+                                        }
+                                        else{
+                                            thread::yield_now();
+                                        }
                                         continue;
                                     },
                                 };
 
+                            last_interaction = Instant::now();
 
                             if bytes > 0{
                                 stream.write(&buffer[..bytes]).unwrap();
@@ -130,10 +138,10 @@ impl TcpSessionHandler {
                         }
                         Ok(_) => {
                             if last_message.elapsed() > message_frequency {
-                                debug!("Idle connection...");
+                                info!("Idle connection...");
                                 last_message = Instant::now();
                             }
-                            thread::sleep(Duration::from_millis(50));
+                            thread::sleep(Duration::from_millis(500));
                         }
                         Err(e) => {
                             error!("Read error: {}",  e);
@@ -147,7 +155,7 @@ impl TcpSessionHandler {
                 write_handler.join().unwrap();
                 info!("Connection closed.");
             } else {
-                thread::sleep(Duration::from_millis(10));
+                thread::sleep(Duration::from_millis(500));
             }
         }
 

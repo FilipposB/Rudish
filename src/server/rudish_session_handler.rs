@@ -3,11 +3,11 @@ use crate::server::{BUFFER_SIZE};
 use std::collections::VecDeque;
 use std::ops::Add;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 use rudish_lib::{drain_from_master_buffer, extract_string, safe_fill, PING, Signal};
-use tracing::{debug, trace};
+use tracing::{trace};
 
 fn add_get_data(data: &[u8]) -> Vec<u8> {
     let data_len = data.len();
@@ -63,6 +63,7 @@ impl RudishSessionHandler {
         let mut data: VecDeque<u8> = VecDeque::new();
         let mut required_bytes: usize = 1;
         let mut signal: Signal= Signal::None;
+        let mut last_interaction = Instant::now();
 
         while !should_terminate.load(Ordering::Relaxed) {
             let mut buffer = [0u8; BUFFER_SIZE];
@@ -71,10 +72,16 @@ impl RudishSessionHandler {
                 match drain_from_master_buffer(&self.master_buffer, &master_buffer_size, &mut buffer){
                     Some(bytes) => bytes,
                     None => {
-                        thread::yield_now();
+                        if last_interaction.elapsed() >  Duration::from_millis(100){
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        else{
+                            thread::yield_now();
+                        }
                         continue;
                     },
                 };
+
 
             data.extend(buffer[..bytes].iter().cloned());
 
@@ -84,6 +91,8 @@ impl RudishSessionHandler {
                     required_bytes = x.0;
                 });
             }
+
+            last_interaction = Instant::now();
         }
     }
 }
@@ -95,8 +104,6 @@ fn process(should_terminate: &AtomicBool, data: &mut VecDeque<u8>, signal: Signa
     if data.is_empty() {
         return None;
     }
-
-    let start_time = Instant::now();
 
     loop {
         match current_signal {
@@ -120,7 +127,7 @@ fn process(should_terminate: &AtomicBool, data: &mut VecDeque<u8>, signal: Signa
                 continue;
             }
             Signal::Put(value) => {
-                let second_top_bits = ((value & 0b0011_0000) >> 4) ;
+                let second_top_bits = (value & 0b0011_0000) >> 4 ;
 
                 let mut needed_bytes = 2;
 
@@ -220,7 +227,7 @@ fn process(should_terminate: &AtomicBool, data: &mut VecDeque<u8>, signal: Signa
             Signal::Ping => {
                 let msg = &[PING];
                 trace!("Received Ping");
-                safe_fill(should_terminate, output_data, write_master_buffer_size, &*msg, 1 );
+                safe_fill(should_terminate, output_data, write_master_buffer_size, &*msg, 1);
                 current_signal = Signal::None
             },
             _ => {}
